@@ -1,0 +1,404 @@
+---
+title: "In Vivo Statistical Analysis Report"
+author: "Crown Bioscience"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+    number_sections: true
+    fig_caption: yes
+    keep_tex: true
+    includes:
+      in_header: header.tex
+geometry: "left=2cm,right=2cm,top=2cm,bottom=2cm"  
+params:
+  source: NA
+  tv_file: NA
+  tv_str: NA
+  p_adj_method: BH	
+  start_day: 0
+  analysis_day: NA
+  tgi_def: 3
+  sel_group: NA
+  ref_group: NA
+  posthoc_cmps: all_pairwise
+  analysis_var: TV
+---
+
+```{r setup, include=FALSE}
+require(dplyr)
+require(magrittr)
+require(ggplot2)
+require(reshape2)
+require(RColorBrewer)
+require(ggpubr)
+require(multcomp)
+require(PMCMRplus)
+require(knitr)
+require(tinytex)
+library(kableExtra)
+require(htmltools)
+knitr::opts_chunk$set(echo = FALSE, fig.pos = "H", message=F, warning = F, error = TRUE)
+options(knitr.table.format = "latex") 
+```
+
+```{r load}
+grps_cols = c("gray0", "red","dark green","yellow","purple","blue","grey",
+             "chartreuse1","light blue","palevioletred1","salmon4","peachpuff","gray48",
+              "greenyellow","orange","salmon","purple2","lightgoldenrod1","brown4","darkorchid4")
+mytheme <- theme(plot.title=element_text(face="bold.italic",size=16, color="brown",hjust=0.5),
+                 axis.title.x=element_text(face="bold.italic",size=14, color="brown"),
+                 axis.text=element_text(face="bold", size=10,color="darkblue"),
+                 axis.title.y=element_text(face="bold",size=14, color="brown"),
+                 strip.text = element_text(face="bold", size=12,color="brown"),
+                 panel.background=element_rect(fill="white",color="darkblue"),
+                 panel.grid.major.y=element_line(color="grey",linetype=1),
+                 panel.grid.minor.y=element_line(color="grey",linetype=2),
+                 panel.grid.minor.x=element_blank(),
+                 legend.position="top")
+
+vecSummary=function(v){
+    mv=sprintf('%.2f',mean(v))
+    n=length(v)
+    sem=sprintf('%.2f',sd(v)/sqrt(n))
+    paste0(mv,' +/- ',sem,'(',n,')')
+}
+
+#convert a matrix a vector
+matrix2vec=function(m){
+    vec=as.vector(m)
+    names(vec)=as.vector(sapply(colnames(m),paste,rownames(m),sep=" - "))
+    vec
+}
+
+#calculate TGI based on tumor volume data
+tgi_defs=c('T/C','Delta(T)/Delta(C)','1-Delta(T)/Delta(C)')
+getTGI=function(tv_long,start_d,ref_g,def=3){
+    tvs=subset(tv_long,day>=start_d)
+    mean_tv_gd=tapply(tvs$TV,list(tvs$Group,tvs$day),mean,na.rm=T)
+    t_c=apply(mean_tv_gd,1,function(x) x/mean_tv_gd[1,])
+    #print(mean_tv_gd)
+    tv_diff=mean_tv_gd-mean_tv_gd[,1]
+    tv_diff=t(tv_diff[,-1])
+    dt_dc=tv_diff/tv_diff[,ref_g]
+    tgi=1-dt_dc
+    if(def==1) tgi=t_c
+    if(def==2) tgi=dt_dc
+    tgi=tgi[,colnames(tgi) != ref_g,drop=F]
+    tgi=round(tgi,3)
+}
+
+p_adj_method=params$p_adj_method #use benjami-hochberg p-value adjust
+start_day=as.numeric(params$start_day) #user specified start day, to calculate RTV
+analysis_day=as.numeric(params$analysis_day) #user specified day for statistical analysis
+tgi_def=as.numeric(params$tgi_def) #TGI definition
+ref_group=params$ref_group #user specified reference group
+sel_group=unlist(strsplit(params$sel_group,"\\s+"))
+posthoc_cmps=params$posthoc_cmps
+mcp_grps=NULL #user specified multi-group comparisons
+analysis_var=params$analysis_var #TV or RTV, user specified variable for statistical analysis
+source=params$source
+tv=NA
+if(source=='upload'){
+   tv=read.csv(params$tv_file,header=T,stringsAsFactors = F) #read raw tumor volume data
+}else if(source=='paste'){
+   tv=read.csv(text=params$tv_str,header=T,stringsAsFactors = F)  
+} 
+#tv=read.csv('../../TV.csv',h=T)
+#if(tv_str != '') tv=read.csv(text=tv_csv,header=T,stringsAsFactors = F) 
+names(tv)[1:2]=c('Group','Mouse')
+names(tv)=gsub('^X','Day',names(tv))
+mouseTV=apply(tv[,c(-1,-2)],1,function(x) any(x>0)) #tv volume of a mouse >0 for any given day
+tv=tv[mouseTV,]
+tv$Group = gsub("^.*?(\\d+).*","G\\1",tv$Group)
+tv$Group = as.factor(tv$Group)
+n_grp = length(levels(tv$Group))
+tv$Mouse = as.factor(tv$Mouse)
+tv_long=melt(tv,id.vars=c(1,2),value.name="TV")
+tv_long=subset(tv_long,!is.na(TV))
+tv_long$day=as.numeric(substr(tv_long$variable,4,10))
+fig_height=n_grp/2*5
+
+
+#tv_long = subset(tv_long, is.numeric(TV) & TV>=0) #remove non-valid tv
+#tv_long=subset(tv_long,day >= start_day)
+tvn = with(tv_long,tapply(TV,list(day,Group),n_distinct))
+dmo = apply(tvn,1,function(x) sum(x>=2,na.rm=T))
+valid_days=as.numeric(names(dmo[dmo>=2]))
+del_days=names(dmo[dmo<2])
+del_days_str='* Statistical analysis requires at least two groups with two or more distinct observations.  
+'
+if(length(del_days)>0) del_days_str=paste0(del_days_str,'* Removing Day **',paste(del_days,collapse = ','),'** from further analysis  ')
+#print(del_d)
+#print(del_days_str)
+tv_long = subset(tv_long,day %in% valid_days)
+tv_long$logTV=log(tv_long$TV+1,10)
+
+if(is.null(start_day)) start_day=min(tv_long$day)
+tv_long=subset(tv_long,day >= start_day)
+day0=ifelse(is.null(start_day),min(tv_long$day),start_day)
+tv0=tv_long[tv_long$day==day0,c('Mouse','TV')]
+names(tv0)[2]='TV0'
+tv_long=merge(tv_long,tv0,by="Mouse")
+tv_long$RTV=ifelse(tv_long$TV0==0,NA,tv_long$TV/tv_long$TV0)
+tv_long$DeltaTV=tv_long$TV-tv_long$TV0
+ndays=length(unique(tv_long$day))
+fig_height_d=ndays/2*5
+font_size_d=8
+if(ndays>8) font_size_d=7
+if(ndays>12) font_size_d=5
+if(ndays>15) font_size_d=4
+font_size_g=7
+if(n_grp>10) font_size_g=6
+#mean_tv=with(tv_long,tapply(TV,list(Group,day),mean,na.rm=T))
+```
+
+\newpage
+#Raw tumor volume data
+`r del_days_str`
+```{r}
+#print(c(sel_group,ref_group))
+colors=brewer.pal(n_grp,'Set3')
+#colors=rainbow(n_grp)
+grps_nm=table(tv$Group)
+rgs=c(0,cumsum(grps_nm))
+k1=tv %>% kable(caption='Raw Tumor Volume data',row.names=F,longtable = T, booktabs = T,linesep = "",digits = 2) %>% 
+    kable_styling(latex_options = c("striped", "scale_down","repeat_header","HOLD_position"),font_size = font_size_d,full_width=F) 
+for(i in 1:n_grp){
+    color_ind = i %% 12
+    if(color_ind==0) color_ind=12
+    k1 = row_spec(k1,(rgs[i]+1):rgs[i+1],background=colors[color_ind])
+}
+if(ndays>15) k1=landscape(k1)
+k1
+```
+
+\newpage
+#Tumor volume data summary
+##Tumor volume summary statistics
+```{r}
+tv_summary=with(tv_long,tapply(TV,list(Group,day),vecSummary)) #A summary of tumor volume statistics,in (mean +/- sem(n) format)
+tv_s=tv_summary %>% kable(caption='Tumor Volume Data summary, formatted as Mean +/- SEM(n)', linesep = "", booktabs = T) %>% 
+    kable_styling(latex_options = c("striped","scale_down","HOLD_position"),full_width=F) %>%
+    column_spec(1,width='8em',bold=T)
+if(ndays>15) tv_s=landscape(tv_s)
+tv_s
+```
+
+
+##Tumor growth curves
+```{r fig1,fig.width=12,fig.height=fig_height,fig.cap="Tumor growth curves"}
+#plot tumor growth curve for each group
+ggplot(tv_long)+aes(day,TV,group=Mouse,color=Group)+scale_color_manual(values=grps_cols)+
+    labs(title='Tumor growth curves',x='Day',y=expression(paste('Tumor Volume ( ',mm^3,')')))+
+    geom_point()+geom_line()+facet_wrap(~Group,ncol=2)+mytheme+theme(legend.position = 'none')
+```
+
+##Tumor volume Mean+/-SEM plot
+```{r fig2,fig.cap="Tumor volume Mean+/-SEM plot"}
+ggline(tv_long,x='day',y='TV',add=c('mean_se'),group = 'Group',title='Tumor volume Mean+/-SEM plot',
+       xlab='Day',ylab=expression(paste('Tumor Volume ( ',mm^3,')')),size=1.5,color='Group',
+       add.params =   list(size=1.5,alpha=0.8,position='dodge'))+scale_color_manual(values=grps_cols)+mytheme
+```
+
+##Compare `r analysis_var` among groups by day, p-value calculated by Kruskal-Wallis test
+```{r fig3,fig.width=12,fig.height=fig_height_d,fig.cap="Compare tumor volume among groups by day"}
+p=ggboxplot(tv_long,x='Group',y=analysis_var,title=paste0(analysis_var,'~Group|Day Boxplot'),add=c('jitter'),color='Group',
+          xlab='Day',facet.by = 'day')+scale_color_manual(values=grps_cols)+
+    stat_compare_means(aes(label = paste0("p=", ..p.format..)),label.x.npc = 'left',label.y.npc = 'top')+mytheme
+facet(p,facet.by = 'day',scales='free',ncol=2)
+```
+
+\newpage
+#Nominal p-values derived from t-test or Mann-Whitney U test
+```{r pval}
+twoSampleTest=function(v1,v2){
+    v1=v1[!is.na(v1)]
+    v2=v2[!is.na(v2)]
+    if(n_distinct(v1)<2 | n_distinct(v2)<2) return(NA)
+    pb=bartlett.test(list(v1,v2))$p.val #bartlett test 
+    pval=NA
+    if(pb<0.05){
+        #pval=round(wilcox.test(v1,v2)$p.val,3)
+        pval=sprintf("%.3g",wilcox.test(v1,v2)$p.val)
+        #pval=wilcox.test(v1,v2)$p.val
+        pval=cell_spec(pval,color=ifelse(as.numeric(pval)<0.05,'red','blue'),
+                       bold = ifelse(as.numeric(pval)<0.01,T,F),background = 'lightgray')
+    }else{
+        pval=sprintf("%.3g",t.test(v1,v2)$p.val)
+        #pval=t.test(v1,v2)$p.val
+        #pval=round(t.test(v1,v2)$p.val,3)
+        pval=cell_spec(pval,color=ifelse(as.numeric(pval)<0.05,'red','blue'),
+                       bold = ifelse(as.numeric(pval)<0.01,T,F))
+    }
+    return(pval)
+}
+#pairwise comparison between groups for some specific day
+cmpDay=function(df,var_sel){
+    groups=as.character(levels(df$Group))
+    gcs=combn(groups,2)
+    pvals=apply(gcs,2,function(x) twoSampleTest(df[df$Group==x[1],var_sel],df[df$Group==x[2],var_sel]))
+    names(pvals)=apply(gcs,2,function(x) paste0(x[1],' vs ',x[2]))
+    pvals
+}
+
+days=split(tv_long,tv_long$day)
+nday=length(days)
+pval_table=do.call(rbind,lapply(days,cmpDay,analysis_var)) #generate norminal p-value table, p-values from mann-whitney test are ended with *
+#pval_table=pval_table[order(rownames(pval_table)),]
+#pairwise.t.test(days[[1]]$TV,days[[1]]$Group,pool.sd = F,p.adjust.method = 'none')
+longtable_flag=ifelse(ncol(pval_table)>30,TRUE,FALSE)
+pval_t= t(pval_table) %>% kable(escape=F,linesep = "", booktabs = T,longtable=longtable_flag,digits = 2,caption=paste0('Comparing two independent groups ',analysis_var,': Nominal p-values')) %>% 
+    kable_styling(latex_options = c("striped","scale_down","HOLD_position"),full_width=T,font_size = font_size_d) %>%
+    add_header_above(c("","Day"=nday),bold = T) %>%
+    column_spec(1,bold=T,border_right = T) %>%
+    footnote(general='p-values from Mann-Whitney U test are denoted with a lightgray background, and p-values smaller than 0.05 are colored red')
+if(ndays>15) pval_t=landscape(pval_t)
+pval_t
+```
+
+\newpage
+#TGI calculation for first day=`r start_day` and `r ref_group` as vehicle group
+```{r}
+tgi_table=getTGI(tv_long,start_day,ref_group,tgi_def)
+tgi_table %>% kable(escape=F,linesep = "", booktabs = T,caption='TGI table') %>%
+    kable_styling(latex_options = c("striped", "scale_down","HOLD_position"),font_size = font_size_g,full_width=T) %>%
+    add_header_above(c("","Group"=ncol(tgi_table)),bold = T) %>%
+    column_spec(1,bold=T,border_right = T) %>%
+    footnote(general=paste0('TGI defined as ',tgi_defs[tgi_def],', calculation based on first day=',start_day,' and ',ref_group,' as vehicle group'))
+```
+
+\newpage
+#Statistical analysis for `r analysis_var` at Day `r analysis_day`
+
+##Compare if groups are equal without multiple comparison correction for `r analysis_var` at Day `r analysis_day`
+```{r fig4,fig.width=12,fig.asp=0.618,fig.cap="Compare Tumor Volume at Selected Date"}
+pct_cutoff=0.8 #percentage cutoff; if analysis day is not specified, pick the last day with valid TV for over pct_cutoff in every group  
+if(is.null(analysis_day)){
+    grp_mouse_n=tapply(tv_long$Mouse,tv_long$Group,function(x) length(unique(x)))
+    day_grp_n=table(tv_long$day,tv_long$Group)
+    day_grp_pct=apply(day_grp_n,1,function(x) x/grp_mouse_n)
+    analysis_day=max(as.numeric(colnames(day_grp_pct)[apply(day_grp_pct,2,function(x) all(x>=pct_cutoff))]))
+}
+
+
+tv_day=subset(tv_long,day==analysis_day & Group %in% sel_group)
+tv_day$Group = factor(tv_day$Group)
+tv_day$Group=relevel(tv_day$Group,ref=ref_group)
+grps=sel_group
+#run bartlett test to test homogeniety of variance and normality
+pb_day=bartlett.test(tv_day$TV,tv_day$Group)$p.val
+all_cmp=as.list(as.data.frame(combn(grps,2)))
+all_cmp=lapply(all_cmp,as.character)
+sel_cmp=rep(T,length(all_cmp))
+if(posthoc_cmps == 'treatment_vs_vehicle') sel_cmp = sapply(all_cmp,function(x) ref_group %in% x)
+test=ifelse(pb_day<0.05,'wilcox.test','t.test')
+p = ggbarplot(tv_day, x = "Group", y = analysis_var, color='Group',fill=NULL,size=2,
+              add=c('mean_se','jitter'),add.params = list(size=1.5),
+              title=paste0('Day ',analysis_day,'-All pairwise comparison: ', test,' nominal p value'))
+#p = ggboxplot(tv_day, x = "Group", y = "TV", add='jitter')
+p = p+scale_color_manual(values=grps_cols)+stat_compare_means(method=test,comparisons = all_cmp[sel_cmp],label='p.signif')+mytheme+theme(legend.position = 'none')
+print(p)
+```
+
+##Compare if groups are equal with multiple comparison correction for `r analysis_var` at Day `r analysis_day`
+
+1. Test of homogeneity of variance by **Bartlett's test**
+3. If p-value of Bartlett's test is **equal to or greater than 0.05**:  
+    + When comparing two groups, run **Welch's t-test** to test if the means of two groups are equal
+    + When comparing more than two groups:
+        + Run **ANOVA** to test if the means of all groups are equal  
+        + Run **Tukey HSD** for all pairwise comparisons or **Dunnett's t test** for each treatment against one control 
+4. If p-value of Bartlett's test is **smaller than 0.05**:
+    + When comparing two groups, run **Mann-Whitney U test** to test if the medians of two groups are equal
+    + When comparing more than two groups:
+        + Run **Kruskal-Wallis test** to test if the medians of all groups are equal  
+        + Run **Conover's non-parametric all-pairs comparison test** for all pairwise comparisons, or **Conover's non-parametric many-to-one comparison test** for each treatment against one control 
+    
+```{r}
+##if number of group is two, then do t-test or mann-whitney U test; or else run ANOVA/kruskal-wallis test and subsequent 
+##posthoc analysis
+grp_n=length(grps)
+rps=NULL #p-values of two group comprison
+omnibus_p=NULL #p-value of omni-bus test (ANOVA/Kruskal-wallis test)
+posthoc_test=''
+if(grp_n==1){
+  print('Only one group,No statistical analysis will be done')      
+}else if(grp_n==2){
+  rps=ifelse(pb_day<0.05,wilcox.test(tv_day[,analysis_var]~tv_day$Group)$p.val,
+             t.test(tv_day[,analysis_var]~tv_day$Group)$p.val)
+  omnibus_p=rps
+  names(rps)=ifelse(pb_day<0.05,'Mann-Whitney U test','T test')
+  names(omnibus_p)=ifelse(pb_day<0.05,'Kruskal-Wallis test','One-way ANOVA')
+}else{
+  if(pb_day<0.05){
+      omnibus_p = kruskal.test(tv_day[,analysis_var]~tv_day$Group)$p.val
+      names(omnibus_p)='Kruskal-Wallis test'
+      posthoc_test = ifelse(posthoc_cmps=='treatment_vs_vehicle','kwManyOneConoverTest','kwAllPairsConoverTest')
+  }else{
+      aov_m=aov(tv_day[,analysis_var]~tv_day$Group)
+      omnibus_p = summary(aov_m)[[1]]$Pr[1]
+      names(omnibus_p)='One-way ANOVA'
+      posthoc_test = ifelse(posthoc_cmps == 'treatment_vs_vehicle','dunnettTest','tukeyTest')
+  }
+  pvals=do.call(posthoc_test,list(tv_day[,analysis_var],tv_day$Group))$p.val
+  rps=matrix2vec(pvals)
+  rps=rps[!is.na(rps)]
+}
+
+all_ps=c(pb_day,omnibus_p,rps)
+test_names=c("Bartlett's test",names(omnibus_p),names(rps))
+   
+
+#significance category, <0.05 *, <0.01 **, <0.001 ***
+sigs=rep('ns',length(all_ps))
+sigs[all_ps<0.05]='*'
+sigs[all_ps<0.01]='**'
+sigs[all_ps<0.001]='***'
+output_df=data.frame('Test'=test_names,'p values'=sprintf("%.3g",all_ps),'significance level'=sigs,stringsAsFactors = F)
+rownames(output_df)=NULL
+output_df$p.values=as.numeric(output_df$p.values)
+#print(output_df)
+if(grp_n==2) output_df=output_df[-2,]
+out_table = output_df %>%  mutate(p.values=cell_spec(p.values,color=ifelse(p.values<0.05,'red','blue'),bold = ifelse(p.values<0.01,T,F))) %>%
+    kable(digits=3,escape=F,booktabs = T,caption=paste0('Comparing two independent groups ',analysis_var, ' at day ',analysis_day)) %>% 
+    kable_styling(latex_options = c("striped", "scale_down","HOLD_position"),full_width=T) %>%
+    column_spec(1,bold=T,border_right = T) %>%
+    group_rows("Test of homogenity of variance and normality", 1, 1, bold=T, hline_after = T)
+if(grp_n>2){
+    out_table %>% group_rows("Test of overall equality among groups", 2, 2, bold=T, hline_after = T) %>%
+    group_rows("Test of equality between individual groups", 3,nrow(output_df), bold=T, hline_after = T) 
+}else{
+    out_table %>% group_rows("Test of equality between two groups", 2,nrow(output_df), bold=T, hline_after = T) 
+}    
+```
+
+```{r, results='asis'}
+output_str=paste0('##Conclusions
+- There are a total of ',grp_n,' groups. ',ref_group, ' is used as the control group.
+')
+if(pb_day<0.05){ 
+    output_str=paste0(output_str,"- Because p-value of Bartlett's test is ",round(pb_day,2)," the homogeneity of variance assumption is violated, we run non-parametric test to compare groups.
+  ")
+}else{
+    output_str=paste0(output_str,"- Because p-value of Bartlett's test is ",round(pb_day,2),", we run parametric test to compare groups.
+  ")
+}
+if(grp_n==2){
+    if(rps<0.05){
+    output_str=paste0(output_str,"- Because p-value is ",sprintf("%.3g",rps), ", **two groups are not equal**.")
+    }else{
+        output_str=paste0(output_str,"- Because p-value of is  ",sprintf("%.3g",rps), ", **no significant difference is detected between two groups**.")
+    }
+}else if(grp_n > 2){
+    if(omnibus_p<0.05){
+    output_str=paste0(output_str,"- Because p-value of ", names(omnibus_p), " is ",sprintf("%.3g",omnibus_p), ", **Group comparisons with red font p-values are not equal**.")
+    }else{
+        output_str=paste0(output_str,"- Because p-value of ", names(omnibus_p), " is ",sprintf("%.3g",omnibus_p), ", **no significant difference is detected among all groups**.")
+    }
+}    
+cat(output_str)
+```
+
+
